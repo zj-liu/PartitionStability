@@ -181,9 +181,9 @@ end
 
 % Parallel computation: Initialize the number of cores if matlabpool is not
 % yet running.
-if PARAMS.ComputeParallel && (matlabpool('size') == 0)
+if PARAMS.ComputeParallel && isempty(gcp('nocreate'))
     flag_matlabpool = true;
-    matlabpool
+    parpool
 end
 
 %$%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%$%
@@ -221,6 +221,8 @@ N = zeros(1, length(Time));
 VI = zeros(1, length(Time));
 C = zeros(PARAMS.NbNodes, length(Time));
 
+%C_all = zeros(PARAMS.NbNodes, PARAMS.NbLouvain*length(Time));% store all partitions
+
 if TextOutput
     mkdir(['Partitions_' prefix]);
 end
@@ -231,6 +233,7 @@ end
 
 if plotStability
     figure_handle = figure;
+    set(figure_handle, 'Position', [100, 100, 600, 1000])
 end
 
 if verbose
@@ -245,9 +248,7 @@ for t=1:length(Time)
         disp(['   Partitioning for Markov time = ' num2str(Time(t),'%10.6f') '...']);
     end
     
-    
-    
-    [S(t), N(t), C(:,t), VI(t) VAROUT] = StabilityFunction(Graph, Time(t), PARAMS);
+    [S(t), N(t), C(:,t), VI(t), VAROUT] = StabilityFunction(Graph, Time(t), PARAMS);
     if isfield(VAROUT,'precomputed')
         PARAMS.precomputed = VAROUT.precomputed;
         PARAMS.pi = VAROUT.pi;
@@ -284,6 +285,8 @@ for t=1:length(Time)
 
 end
 
+
+
 if verbose
     c = clock;
     disp(' ');
@@ -295,13 +298,79 @@ if verbose
     disp(['   Total time needed: ' datestr([2011 1 1 nb_hours nb_min nb_sec], 'HH:MM:SS')]);%num2str(nb_hours) ':' num2str(nb_min) ':' num2str(nb_sec)]);
 end
 
-
 if OutputFile
     save(['Stability_' prefix '.mat'],'Time','S','N','VI','C','-append');
 end
 
+disp('Postprocessing...')
+if strfind(func2str(StabilityFunction), 'N')
+    PARAMS.laplacian = 'normalized'; 
+else 
+    PARAMS.laplacian = 'combinatorial'; 
+end
+if Full
+    PARAMS.linearised = false;
+else
+    PARAMS.linearised = true;
+end
+if size(G,1) ~= size(G,2)
+    if size(G,2)==3
+        A=sparse(G(:,1)+1,G(:,2)+1,G(:,3));
+    elseif size(G,2)==2
+        A=sparse(G(:,1)+1,G(:,2)+1,ones(length(G(:,1)),1));
+    else
+        error('Wrong size for G: G should be a graph saved either as a list of edges (size(G)=[N,3] if weighted, size(G)=[N,2] if unweighted) or as an adjacency matrix (size(G)=[N,N])');
+    end
+else
+    A = sparse(G);
+end
+[S,N,C,VI] = stability_postprocess_data(S,N,C,VI,Time,A,PARAMS);
+
+if plotStability
+    stability_plot(Time,t,S,N,VI,PARAMS.ComputeVI,figure_handle);
+end
+
+if plotStability
+    [~,vi_mat] = varinfo(C',PARAMS.ComputeParallel);
+    set(0,'CurrentFigure',figure_handle);
+
+    % plot the vi(t,t')
+    ax1 = axes();
+    n = length(Time);
+    imagesc(ax1,[0,n-1],[0,n-1],vi_mat); colormap pink
+    axis(ax1,'off');
+    c = colorbar;
+    c.Location = 'southoutside';
+    c.Position = [0.66,0.066,0.2,0.02];
+    c.Label.String = 'VI(t,t'')';
+    % plot the Vi and N
+    ax2 = axes();
+    ax2.Color = 'none';
+    
+    yyaxis(ax2,'left')
+    plot(ax2,Time,N,'LineWidth',1.5)
+    ylim([1,10^(ceil(log10(max(N))))])
+    xlabel('Markov time')
+    ylabel('Number of communities')
+    set(ax2(1),'YScale','log')
+    set(ax2(1),'XScale','log')
+    
+    yyaxis(ax2,'right')
+    plot(ax2,Time,VI,'Color',[0 0.7 0],'LineWidth',1.5)
+    ylim([0 max(VI)*1.1])
+    ax2.YAxis(2).Color = [0 0.7 0];
+    ylabel('Variation of information','Color',[0 0.7 0])
+    
+    subplot(4,1,[3,4],ax1);
+    subplot(4,1,[3,4],ax2);
+end
+
+if OutputFile
+    save(['Stability_' prefix '_PP.mat'],'Time','S','N','VI','C','-append');
+end
+
 if flag_matlabpool
-    matlabpool close;
+    delete(gcp('nocreate'));
 end
 
 
@@ -395,7 +464,7 @@ if options > 0
                 PARAMS.precomputed = true;
                 i = i+1;
             elseif strcmpi(varargin{i},'p')
-                if exist('matlabpool','file')
+                if exist('parpool','file')
                     PARAMS.ComputeParallel = true;
                 else
                     PARAMS.ComputeParallel = false;
@@ -542,7 +611,7 @@ if PARAMS.precomputed == false
             * ones(PARAMS.NbNodes)/PARAMS.NbNodes;
         
         clear Dout dangling
-        [v lambda_all] = eigs(M'); % largest eigenvalue of transition matrix corresponds to stat.distribution.
+        [v, lambda_all] = eigs(M'); % largest eigenvalue of transition matrix corresponds to stat.distribution.
         lambda = max(diag(lambda_all));
         v = v(:,diag(lambda_all) == lambda);
         v = abs(v);              % make sure eigenvector is positive
@@ -568,6 +637,7 @@ if PARAMS.precomputed == false
         VAROUT.P = trans;
         
         clear trans;
+
         exponential=expm(time.*Lap);
         clear Lap;
         
@@ -812,7 +882,7 @@ if PARAMS.directed == true
             * ones(PARAMS.NbNodes)/PARAMS.NbNodes;
         
         clear Dout dangling
-        [v lambda_all] = eigs(M'); % largest eigenvalue of transition matrix corresponds to stat.distribution.
+        [v, lambda_all] = eigs(M'); % largest eigenvalue of transition matrix corresponds to stat.distribution.
         lambda = max(diag(lambda_all));
         v = v(:,diag(lambda_all) == lambda);
         v = abs(v);              % make sure eigenvector is positive
@@ -928,10 +998,10 @@ function Graph = check(Graph, verbose, PARAMS)
 		end
 	end
     end
-    
+
     % Check for isolated nodes
-    if ( any( sum(abs(Graph))' == 0 & sum(abs(Graph),2) == 0 ) )
-        warning('There are isolated nodes in the graph!?');
+    if nnz(sum(Graph))~=size(Graph,2)
+        warning('There are isolated nodes in the graph');
     end
     
     % Check for disconnected components
@@ -972,7 +1042,7 @@ function [] = stability_plot(Time,t,S,N,VI,ComputeVI,figure_handle)
 set(0,'CurrentFigure',figure_handle);
 
 if ComputeVI
-    subplot(2,1,1), ax=plotyy(Time(1:t),N(1:t),Time(N>1),S(N>1));
+    subplot(4,1,1), ax=plotyy(Time(1:t),N(1:t),Time(N>1),S(N>1));
 else
     ax=plotyy(Time(1:t),N(1:t),Time(N>1),S(N>1));
 end
@@ -987,13 +1057,14 @@ set(ax(1),'XLim', [10^floor(log10(Time(1))) 10^ceil(log10(Time(end)))], 'YLim', 
 set(ax(2),'XLim', [10^floor(log10(Time(1))) 10^ceil(log10(Time(end)))], 'YLim', [10^floor(log10(min(S(N>1)))), 1], 'XScale','log');
 ylabel('Number of communities');
 if ComputeVI 
-    subplot(2,1,2), semilogx(Time(1:t),VI(1:t));
-    set(gca, 'XLim', [10^floor(log10(Time(1))) 10^ceil(log10(Time(end)))], 'YMinorGrid','on','XMinorGrid','on');
+    subplot(4,1,2), semilogx(Time(1:t),VI(1:t),'Color',[0 0.7 0],'LineWidth',1.5);
+    set(gca, 'XLim', [10^floor(log10(Time(1))) 10^ceil(log10(Time(end)))], ...
+        'YMinorGrid','on','XMinorGrid','on','YColor', [0 0.7 0]);
     if max(VI)>0
         set(gca,'YLim', [0 max(VI)*1.1]);
     end
     xlabel('Markov time');
-    ylabel('Variation of information');
+    ylabel('Variation of information','Color',[0 0.7 0]);
 end
 drawnow;
 
